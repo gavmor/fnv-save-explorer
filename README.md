@@ -24,6 +24,7 @@ a CLI — and validated against real saves.
 | **Player inventory** (item stacks in the player's inventory change form) | ✅ **deterministic** decode **and safely editable** — `[ref][7C][u32 count][7C]` + per-stack extra data (`ref` = index + 1); confirmed by controlled diffs (Antivenom 1→2→1) — every stack resolves with correct counts, no scan window. List start is a **pure structural walk** (no scan): MOVE block + **fixed 1160-byte havok array** + **sized ExtraDataList** → the **`vsval` stack count** → first item; byte-identical on all 30 saves, deterministic path taken on all 30 |
 | **Item condition / equipped / mods** (per-stack extra data) | ✅ cracked by a controlled 3-save diff — condition (`0x25` float, **editable**), equipped (`0x16`), weapon-mod ref (`0x21`); surfaced in CLI + GUI |
 | **FormID → display name** (item names from the game's ESM/ESP masters) | ✅ custom TES4 reader resolves inventory/FormID names (Stimpak, Vault 21 Jumpsuit…); all 10 base+DLC plugins parse, DLC renumbering + compressed records handled; works on **Mod Organizer 2 / Viva New Vegas** saves (auto-detects the MO2 `mods\` folder) |
+| **Weapon combat stats** (real `WEAP`/`PROJ`/`EXPL` record decode) | ✅ decoded straight from game-file bytes, not estimated — per-weapon damage, skill, strength/skill requirement, weight, and (for thrown/launched explosives) the **real area damage**, resolved via `DNAM.Projectile → PROJ.DATA.Explosion → EXPL.DATA.Damage` (a WEAP's own `BaseDamage` is only a direct-hit placeholder for those). A 5-tiebreaker decision matrix (skill tier → DPS → ammo stock → condition → weight) ranks the player's inventory weapons; ammo stock resolves through `NAM0`, including `FLST` shared-ammo lists. CLI `weapons`. Read-only |
 | **Inventory list start — modded too** | ✅ **deterministic on all 607 real saves** (vanilla 30, base VNV 98, VNV Extended 479): the typed-entry ExtraDataList walk (variable order + modded `0x1D`/`0x75`) + the ExtraDataList-header anchor for havok-physics records → the `vsval` count |
 | **Caps** (the `0x0000000F` "Bottle Cap" stack) | ✅ decoded **and safely editable** |
 | **Karma + XP** (float actor-values in the player reference) | ✅ decoded **and safely editable** — cracked via a float-aware diff (slot 100 = karma, 101 = XP), confirmed on a 2nd character |
@@ -172,9 +173,10 @@ even though the body isn't fully understood.
 ## Projects
 
 - `src/FnvSaveExplorer.Core` — UI-agnostic parser/writer (`FalloutSave`, `ByteReader`, `SaveScreenshot`)
-  plus the FormID-name resolver (`TesPlugin`, `PluginDatabase`, `GameDataLocator`).
+  plus the FormID-name resolver (`TesPlugin`, `PluginDatabase`, `GameDataLocator`) and the real weapon
+  combat-stats reader (`WeaponStatsDatabase`, `WeaponRanking`).
 - `src/FnvSaveExplorer.App` — WPF GUI: screenshot, character panel, plugins, File Location Table, SPECIAL/skills/inventory/caps/karma/XP safe edits, named inventory, the full Notes tab (read/unread + media type), and Perks / Addictions tabs.
-- `src/FnvSaveExplorer.Cli` — `dump`, `flt`, `check`, `setlevel`, `special`, `skills`, `setskill`, `inventory`, `setcount`, `setcondition`, `names`, `notes`, `perks`, `addictions`, `effects`, `caps`/`setcaps`, `karma`/`xp`/`setkarma`/`setxp`, `walk`, `cfwalk`, `refdump`, `find`, `diff`/`idiff` (+ `idiff … clean`)/`fdiff`, `notescan`, `resolve`, `playerdump`, … (run with no args to list all).
+- `src/FnvSaveExplorer.Cli` — `dump`, `flt`, `check`, `setlevel`, `special`, `skills`, `setskill`, `inventory`, `weapons`, `setcount`, `setcondition`, `names`, `notes`, `perks`, `addictions`, `effects`, `caps`/`setcaps`, `karma`/`xp`/`setkarma`/`setxp`, `walk`, `cfwalk`, `refdump`, `find`, `diff`/`idiff` (+ `idiff … clean`)/`fdiff`, `notescan`, `resolve`, `playerdump`, … (run with no args to list all).
 - `tests/FnvSaveExplorer.Tests` — synthetic-save unit tests + a theory that round-trips every real `.fos` it finds.
 
 ## Usage
@@ -190,6 +192,7 @@ dotnet run --project src/FnvSaveExplorer.Cli -- dump    "<save.fos>"   # metadat
 dotnet run --project src/FnvSaveExplorer.Cli -- special "<save.fos>"   # player SPECIAL
 dotnet run --project src/FnvSaveExplorer.Cli -- skills  "<save.fos>"   # stored skill modifications
 dotnet run --project src/FnvSaveExplorer.Cli -- inventory "<save.fos>" # player inventory (name + FormID x count)
+dotnet run --project src/FnvSaveExplorer.Cli -- weapons "<save.fos>"   # weapon decision matrix (real combat stats, not estimated)
 dotnet run --project src/FnvSaveExplorer.Cli -- notes   "<save.fos>"   # Pip-Boy notes — read AND unread + type
 dotnet run --project src/FnvSaveExplorer.Cli -- karma   "<save.fos>"   # player karma (and `xp` for XP)
 dotnet run --project src/FnvSaveExplorer.Cli -- names   "<save.fos>"   # FormID->name resolver status (masters)

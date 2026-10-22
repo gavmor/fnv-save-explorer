@@ -35,6 +35,11 @@ if (args.Length < 2)
           fnvsave setskill <in.fos> <out.fos> <skill> <value>  Edit a stored skill (writes a new file)
           fnvsave inventory <save.fos> [dataDir]   Show the player's inventory (resolves item names from
                                               the game masters; dataDir overrides Data-folder auto-detect)
+          fnvsave weapons <save.fos> [dataDir]   Rank inventory weapons by a 5-tiebreaker decision matrix: skill
+                                              tier (declaration order below - override in code for your tagged
+                                              skill, it isn't derivable from the save), then DPS, stock,
+                                              condition, weight. Real combat stats incl. explosive area damage,
+                                              read from WEAP/PROJ/EXPL records (not wiki/estimated)
           fnvsave names <save.fos> [dataDir]  Report FormID -> name resolution status (which masters resolved)
           fnvsave notes <save.fos> [dataDir]  List the player's Pip-Boy Data -> Notes — READ and UNREAD (§4k/§4k.1)
           fnvsave perks <save.fos> [dataDir]  List the player's perks + traits (§4n; resolves PERK forms via masters)
@@ -328,6 +333,9 @@ try
             return SetSkill(path, args[2], args[3], float.Parse(args[4]));
         case "inventory":
             Inventory(FalloutSave.Load(path), path, args.Length > 2 ? args[2] : null);
+            break;
+        case "weapons":
+            Weapons(FalloutSave.Load(path), path, args.Length > 2 ? args[2] : null);
             break;
         case "names":
             Names(FalloutSave.Load(path), path, args.Length > 2 ? args[2] : null);
@@ -1079,6 +1087,73 @@ static void Inventory(FalloutSave s, string savePath, string? dataDir)
             extra += $"  0x21-ref: {string.Join(", ", item.ExtraRefIds.Select(r => db.Resolve(s.ResolveIref(r)) ?? $"0x{s.ResolveIref(r):X8}"))}";
         var countStr = item.IsCountSentinel ? "-1" : item.Count.ToString();   // -1 = equipped base/quest sentinel
         Console.WriteLine($"  {name,-28}  {tab,-14} 0x{item.FormId:X8} (mod {item.ModIndex:X2})  {src,-22}  x{countStr,-6} iref {item.Iref,-6} (edit 0x{item.CountValueOffset:X}){extra}");
+    }
+}
+
+static void Weapons(FalloutSave s, string savePath, string? dataDir)
+{
+    var inv = s.Inventory;
+    if (inv is null)
+    {
+        Console.WriteLine("Inventory not located (no change form parsed as a recognisable item list).");
+        return;
+    }
+    var mods = GameDataLocator.FindMo2Mods(savePath);
+    var db = PluginDatabase.ForSave(s, dataDir, mods);
+    var weaponDb = WeaponStatsDatabase.ForSave(s, dataDir, mods);
+    if (weaponDb.ResolvedPlugins.Count == 0)
+    {
+        Console.WriteLine("(weapon stats unavailable — game Data folder not found; pass it as the 2nd argument)");
+        return;
+    }
+
+    // Skill-tier priority: NOT derivable from the save (tagged-skill info isn't stored there, only manual
+    // skill-point top-ups — a tagged skill's own +15 never shows as a stored deviation). This default is just
+    // enum declaration order; edit it to your character's actual tagged/primary skill.
+    var tierPriority = new Dictionary<WeaponSkillTier, int>
+    {
+        [WeaponSkillTier.EnergyWeapons] = 0,
+        [WeaponSkillTier.Guns] = 1,
+        [WeaponSkillTier.Explosives] = 2,
+        [WeaponSkillTier.MeleeWeapons] = 3,
+        [WeaponSkillTier.Unarmed] = 4,
+        [WeaponSkillTier.Unknown] = 5,
+    };
+
+    // Stock = how long this weapon can be sustained, not how many of the gun itself are owned (almost always
+    // 1 - a gun isn't a stackable consumable). For an ammo-consuming weapon that means the ammo's own stack
+    // count; a self-ammo'd weapon (thrown/placed ordnance) consumes its own stack directly.
+    var stockByFormId = new Dictionary<uint, long>();
+    foreach (var it in inv.Items)
+        stockByFormId[it.FormId] = stockByFormId.GetValueOrDefault(it.FormId) + (it.IsCountSentinel ? 1 : it.Count);
+
+    var entries = new List<WeaponRankingEntry>();
+    foreach (var item in inv.Items)
+    {
+        if (db.RecordType(item.FormId) != "WEAP")
+            continue;
+        var stats = weaponDb.Stats(item.FormId);
+        if (stats is null)
+            continue; // no WEAP combat-stat record found for this FormID
+        var name = db.Resolve(item.FormId) ?? "?";
+        var conditionPct = item.Condition is { } c && db.ItemHealthMax(item.FormId) is { } max && max > 0
+            ? c / max : (double?)null;
+        var ammoStock = stats.AmmoFormIds.Sum(id => stockByFormId.GetValueOrDefault(id));
+        var stock = stats.AmmoFormIds.Count > 0
+            ? (int)Math.Min(ammoStock, int.MaxValue)
+            : (item.IsCountSentinel ? 1 : (int)item.Count);
+        entries.Add(new WeaponRankingEntry(name, WeaponSkillTierExtensions.Of(stats.Skill), stats.ApproxDps, stock, conditionPct, stats.Weight));
+    }
+
+    var ranked = WeaponRanking.Rank(entries, tierPriority);
+    Console.WriteLine($"Weapon decision matrix ({ranked.Count} weapons; tiebreakers: 1 skill tier, 2 approx DPS, 3 stock (ammo reserves where applicable), 4 condition, 5 weight):");
+    for (var i = 0; i < ranked.Count; i++)
+    {
+        var w = ranked[i];
+        var dps = w.Dps is { } d ? d.ToString("F1") : "UNCONFIRMED";
+        var cond = w.ConditionPct is { } cp ? $"{cp:P0}" : "n/a";
+        var weight = w.Weight is { } wt ? wt.ToString("F2") : "n/a";
+        Console.WriteLine($"{i + 1,2}. [{w.Tier,-13}] {w.Name,-28} ApproxDPS={dps,-10} Stock={w.Stock,-6} Cond={cond,-6} Weight={weight}");
     }
 }
 

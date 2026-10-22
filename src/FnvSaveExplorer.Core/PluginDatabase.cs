@@ -235,13 +235,9 @@ public sealed class PluginDatabase
                 continue; // skip an unreadable plugin rather than failing the whole build
             }
 
-            // Map each plugin-local high byte to a save load-order index.
-            var remap = new int[256];
-            Array.Fill(remap, -1);
-            for (var j = 0; j < plugin.Masters.Count && j < remap.Length; j++)
-                remap[j] = indexOf.TryGetValue(plugin.Masters[j], out var idx) ? idx : -1;
-            if (plugin.Masters.Count < remap.Length)
-                remap[plugin.Masters.Count] = i; // the plugin's own forms
+            // Map each plugin-local high byte to a save load-order index (PluginFormIdRemap, shared with
+            // WeaponStatsDatabase so neither duplicates nor depends on the other's broader surface).
+            var remap = PluginFormIdRemap.BuildTable(plugin.Masters, i, indexOf);
 
             foreach (var (localFormId, name, type, noteType, health, spellType) in plugin.Forms)
             {
@@ -343,12 +339,9 @@ public sealed class PluginDatabase
     }
 
     /// <summary>Re-keys a plugin-local FormID into save space using the plugin's high-byte → save-index
-    /// <paramref name="remap"/>, or null when its master isn't in this save's load order.</summary>
-    private static uint? Remap(uint localFormId, int[] remap)
-    {
-        var saveHigh = remap[(int)(localFormId >> 24)];
-        return saveHigh < 0 ? null : ((uint)saveHigh << 24) | (localFormId & 0x00FFFFFF);
-    }
+    /// <paramref name="remap"/>, or null when its master isn't in this save's load order. Thin wrapper over
+    /// the shared <see cref="PluginFormIdRemap"/> — kept so the 12 call sites above read as plain <c>Remap(...)</c>.</summary>
+    private static uint? Remap(uint localFormId, int[] remap) => PluginFormIdRemap.Resolve(localFormId, remap);
 
     /// <summary>Process-lifetime cache of the resolved plugin-name -&gt; path map, keyed by the
     /// (dataFolder, modsFolder) pair: a <c>Data</c>/<c>mods</c> tree's file set doesn't change while a CLI

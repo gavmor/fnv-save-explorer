@@ -71,6 +71,32 @@ public sealed class TesPlugin
     /// </summary>
     public IReadOnlyList<(uint LocalFormId, string Name, string Type, int NoteType, int Health, int SpellType)> Forms { get; }
 
+    /// <summary>Every <c>WEAP</c> record's real combat stats (not estimated or looked up externally — decoded
+    /// straight from its own <c>DATA</c>/<c>DNAM</c> structs), keyed by plugin-local FormID. Unconditionally
+    /// captured alongside <see cref="Forms"/>: the extra fields sit in subrecords already being read for
+    /// naming/health, so there is no additional group to walk. Re-keyed into save space — and, for an
+    /// explosive weapon, resolved to its real area damage via <see cref="Projectiles"/>/<see cref="Explosions"/>
+    /// — by <see cref="WeaponStatsDatabase"/>.</summary>
+    public IReadOnlyList<RawWeaponStats> WeaponRecords { get; }
+
+    /// <summary>Every <c>PROJ</c> record's <c>DATA.Explosion</c> link, keyed by plugin-local FormID. Empty
+    /// unless the plugin was read with <c>readWeaponStats: true</c> — unlike <see cref="WeaponRecords"/>, this
+    /// is a GRUP nothing else reads, so walking it is real added cost, gated like <c>readDialogue</c>/
+    /// <c>readActors</c>.</summary>
+    public IReadOnlyList<RawProjectile> Projectiles { get; }
+
+    /// <summary>Every <c>EXPL</c> record's real area <c>Damage</c>/<c>Radius</c>, keyed by plugin-local
+    /// FormID — the ground truth a thrown/launched explosive weapon's own <c>WEAP.DATA.BaseDamage</c> cannot
+    /// show (that field is just a direct-hit placeholder there). Empty unless read with
+    /// <c>readWeaponStats: true</c>.</summary>
+    public IReadOnlyList<RawExplosion> Explosions { get; }
+
+    /// <summary>Every <c>FLST</c> (FormID List) record's member FormIDs, keyed by plugin-local FormID —
+    /// decodes a weapon's shared-ammo list (<c>WEAP.NAM0</c> often points at one of these rather than a single
+    /// <c>AMMO</c> record directly, e.g. a .357 Magnum Round's HP/Hand Load/Match variants share one list).
+    /// Empty unless read with <c>readWeaponStats: true</c>.</summary>
+    public IReadOnlyList<RawFormList> FormLists { get; }
+
     /// <summary>The <c>QUST</c> records' decoded stage/objective structure, keyed by <b>plugin-local</b>
     /// FormID (re-keyed into save space by <see cref="PluginDatabase"/>) — the masters side of the quest-log
     /// reader (ROADMAP §6 #10). Empty unless the plugin defines quests.</summary>
@@ -132,6 +158,10 @@ public sealed class TesPlugin
         string fileName,
         IReadOnlyList<string> masters,
         IReadOnlyList<(uint, string, string, int, int, int)> forms,
+        IReadOnlyList<RawWeaponStats> weaponRecords,
+        IReadOnlyList<RawProjectile> projectiles,
+        IReadOnlyList<RawExplosion> explosions,
+        IReadOnlyList<RawFormList> formLists,
         IReadOnlyList<QuestDefinition> quests,
         IReadOnlyList<(uint, IReadOnlyList<QuestScriptEffect>, IReadOnlyList<InfoCondition>)> dialogueInfos,
         IReadOnlyList<CounterIncrement> counterIncrements,
@@ -144,6 +174,10 @@ public sealed class TesPlugin
         FileName = fileName;
         Masters = masters;
         Forms = forms;
+        WeaponRecords = weaponRecords;
+        Projectiles = projectiles;
+        Explosions = explosions;
+        FormLists = formLists;
         Quests = quests;
         DialogueInfos = dialogueInfos;
         CounterIncrements = counterIncrements;
@@ -163,18 +197,18 @@ public sealed class TesPlugin
     /// invocation of <c>inventory</c>/<c>names</c>/<c>notes</c>/<c>perks</c>/... in a long-lived process, or every
     /// repeated GUI refresh) even though the plugin files never changed between calls.
     /// </summary>
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string Path, long Length, long WriteTicks, bool ReadDialogue, bool ReadActors), TesPlugin> _cache = new();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string Path, long Length, long WriteTicks, bool ReadDialogue, bool ReadActors, bool ReadWeaponStats), TesPlugin> _cache = new();
 
-    public static TesPlugin Load(string path, bool readDialogue = false, bool readActors = false)
+    public static TesPlugin Load(string path, bool readDialogue = false, bool readActors = false, bool readWeaponStats = false)
     {
         var full = Path.GetFullPath(path);
         var info = new FileInfo(full);
-        var key = (full, info.Length, info.LastWriteTimeUtc.Ticks, readDialogue, readActors);
+        var key = (full, info.Length, info.LastWriteTimeUtc.Ticks, readDialogue, readActors, readWeaponStats);
         if (_cache.TryGetValue(key, out var cached))
             return cached;
 
         using var fs = File.OpenRead(path);
-        var plugin = Read(fs, Path.GetFileName(path), readDialogue, readActors);
+        var plugin = Read(fs, Path.GetFileName(path), readDialogue, readActors, readWeaponStats);
         _cache[key] = plugin;
         return plugin;
     }
@@ -183,8 +217,12 @@ public sealed class TesPlugin
     /// <paramref name="readDialogue"/> additionally descends into the <c>DIAL</c> group to collect <c>INFO</c>
     /// result-script quest effects (off by default — it is the heaviest group; ROADMAP §6 #16 Phase B).
     /// <paramref name="readActors"/> reads <c>NPC_</c>/<c>CREA</c> <c>SCRI</c> links for the Stage-2 kill-completion
-    /// binding (cheap — base-actor groups only, no worldspace descent).</summary>
-    public static TesPlugin Read(Stream fs, string fileName, bool readDialogue = false, bool readActors = false)
+    /// binding (cheap — base-actor groups only, no worldspace descent). <paramref name="readWeaponStats"/>
+    /// additionally descends into the <c>PROJ</c>/<c>EXPL</c> groups (<see cref="Projectiles"/>/
+    /// <see cref="Explosions"/>) so an explosive weapon's real area damage can be resolved; off by default since
+    /// nothing else reads those groups. <see cref="WeaponRecords"/> itself is always populated — its extra
+    /// fields come from subrecords <c>WEAP</c> naming already reads, so gating it saves nothing.</summary>
+    public static TesPlugin Read(Stream fs, string fileName, bool readDialogue = false, bool readActors = false, bool readWeaponStats = false)
     {
         // ---- TES4 header record (always first) ----
         var sig = ReadSignature(fs) ?? throw new SaveFormatException($"{fileName}: empty file", 0);
@@ -203,6 +241,10 @@ public sealed class TesPlugin
 
         // ---- top-level groups ----
         var forms = new List<(uint, string, string, int, int, int)>();
+        var weaponStats = new List<RawWeaponStats>(); // WEAP real combat stats - always captured alongside forms
+        var projectiles = new List<RawProjectile>(); // PROJ.DATA.Explosion - only when readWeaponStats
+        var explosions = new List<RawExplosion>(); // EXPL.DATA.Damage/Radius - only when readWeaponStats
+        var formLists = new List<RawFormList>(); // FLST LNAM members - only when readWeaponStats (NAM0 ammo lists)
         var quests = new List<QuestDefinition>();
         var dialogueInfos = new List<(uint, IReadOnlyList<QuestScriptEffect>, IReadOnlyList<InfoCondition>)>();
         // SCPT FormID -> (GameMode block source, declared local-variable names) (ROADMAP §6 #16)
@@ -234,7 +276,13 @@ public sealed class TesPlugin
 
             var labelType = Encoding.ASCII.GetString(label);
             if (groupType == 0 && (NamedTypes.Contains(labelType) || labelType == "SCPT"))
-                ReadRecords(fs, contentSize, localized, forms, quests, scripts, scriptVarNames, counterIncrements, externalQuestEffects, completionEnables);
+                ReadRecords(fs, contentSize, localized, forms, weaponStats, quests, scripts, scriptVarNames, counterIncrements, externalQuestEffects, completionEnables);
+            else if (groupType == 0 && labelType == "PROJ" && readWeaponStats)
+                ReadProjectiles(fs, contentSize, projectiles);
+            else if (groupType == 0 && labelType == "EXPL" && readWeaponStats)
+                ReadExplosions(fs, contentSize, explosions);
+            else if (groupType == 0 && labelType == "FLST" && readWeaponStats)
+                ReadFormLists(fs, contentSize, formLists); // NAM0 ammo lists (HP/AP/Match variants share one WEAP.NAM0)
             else if (groupType == 0 && labelType == "DIAL" && readDialogue)
                 ReadInfoEffects(fs, contentSize, dialogueInfos); // descend DIAL -> Topic Children -> INFO (Phase B)
             else if (groupType == 0 && labelType is "NPC_" or "CREA" && readActors)
@@ -259,7 +307,7 @@ public sealed class TesPlugin
                 quests[i] = quests[i] with { LocalVarNames = vn };
         }
 
-        return new TesPlugin(fileName, masters, forms, quests, dialogueInfos, counterIncrements, externalQuestEffects,
+        return new TesPlugin(fileName, masters, forms, weaponStats, projectiles, explosions, formLists, quests, dialogueInfos, counterIncrements, externalQuestEffects,
             actorScripts.Select(kv => (kv.Key, kv.Value)).ToList(),
             placedBases.Select(kv => (kv.Key, kv.Value)).ToList(),
             placedEdids.Select(kv => (kv.Key, kv.Value)).ToList(),
@@ -460,7 +508,7 @@ public sealed class TesPlugin
     /// <summary>Reads the records (and defensively skips any nested groups) inside one top-level item group.</summary>
     private static void ReadRecords(
         Stream fs, long contentSize, bool localized,
-        List<(uint, string, string, int, int, int)> forms, List<QuestDefinition> quests,
+        List<(uint, string, string, int, int, int)> forms, List<RawWeaponStats> weaponStats, List<QuestDefinition> quests,
         Dictionary<uint, (string GameMode, List<string> Locals)> scripts,
         Dictionary<uint, IReadOnlyDictionary<int, string>> scriptVarNames,
         List<CounterIncrement> counterIncrements,
@@ -534,15 +582,51 @@ public sealed class TesPlugin
             var noteType = -1;
             var health = 0;
             var spellType = -1;
+            // WEAP-only combat stats (ROADMAP: weapon decision-matrix): -1/0 sentinels mean "this record
+            // carried no usable DATA/DNAM" (e.g. a broken/debug weapon form) rather than a real zero.
+            int baseDamage = -1, clipSize = -1, skillAv = -1, strengthReq = -1, skillReq = -1;
+            float weight = -1, fireRate = -1;
+            uint projectileFormId = 0, ammoFormId = 0;
             foreach (var (type, sub) in subs)
             {
                 if (type == "EDID") edid = ZString(sub);
                 else if (type == "FULL" && !localized) full = ZString(sub);
                 else if (type == "DATA" && sig == "NOTE" && sub.Length >= 1) noteType = sub[0]; // 0=Sound 1=Text 2=Image 3=Voice
-                // WEAP/ARMO DATA = int32 value, int32 health, float weight — health (max condition) is the int32 at
-                // offset 4 (ROADMAP §6 #4). Clamp negatives to 0 (treated as "no max").
+                // WEAP/ARMO DATA = int32 value, int32 health, float weight, int16 baseDamage, uint8 clipSize —
+                // health (max condition) is the int32 at offset 4 (ROADMAP §6 #4). Clamp negatives to 0 (treated
+                // as "no max"). The weight/baseDamage/clipSize fields only mean anything for WEAP (ARMO's DATA
+                // struct ends at the health field - reading further would be garbage), per the published WEAP
+                // layout (https://tes5edit.github.io/fopdoc/FalloutNV/Records/WEAP.html). Both live in the SAME
+                // DATA subrecord, so this must be one branch, not two `else if`s - two would make the second
+                // unreachable (the first's weaker condition already matches every WEAP DATA too).
                 else if (type == "DATA" && (sig == "WEAP" || sig == "ARMO") && sub.Length >= 8)
+                {
                     health = Math.Max(0, BinaryPrimitives.ReadInt32LittleEndian(sub.AsSpan(4, 4)));
+                    if (sig == "WEAP" && sub.Length >= 15)
+                    {
+                        weight = BinaryPrimitives.ReadSingleLittleEndian(sub.AsSpan(8, 4));
+                        baseDamage = BinaryPrimitives.ReadInt16LittleEndian(sub.AsSpan(12, 2));
+                        clipSize = sub[14];
+                    }
+                }
+                // WEAP DNAM: a long fixed struct: Skill (plain Actor-Value int32) at offset 104, Strength
+                // Requirement (uint32) at 168, Skill Requirement (uint32) at 200, Fire Rate (float32) at 64,
+                // Projectile (formid) at 36 — the only path to an explosive weapon's real area damage (its own
+                // DATA.BaseDamage is just a direct-hit placeholder), resolved via Projectiles/Explosions below.
+                else if (type == "DNAM" && sig == "WEAP" && sub.Length >= 204)
+                {
+                    projectileFormId = BinaryPrimitives.ReadUInt32LittleEndian(sub.AsSpan(36, 4));
+                    fireRate = BinaryPrimitives.ReadSingleLittleEndian(sub.AsSpan(64, 4));
+                    skillAv = BinaryPrimitives.ReadInt32LittleEndian(sub.AsSpan(104, 4));
+                    strengthReq = (int)BinaryPrimitives.ReadUInt32LittleEndian(sub.AsSpan(168, 4));
+                    skillReq = (int)BinaryPrimitives.ReadUInt32LittleEndian(sub.AsSpan(200, 4));
+                }
+                // WEAP NAM0 = Ammo (formid of an AMMO or FLST record, or null/0 for a self-ammo'd weapon -
+                // thrown/placed ordnance that consumes itself, e.g. Dynamite/Frag Grenade/Frag Mine/Throwing
+                // Spear). The real "how much can I sustain this weapon with" figure is this ammo's OWN
+                // inventory stock, not the gun's own stack count (almost always 1 - you don't carry 5 pistols).
+                else if (type == "NAM0" && sig == "WEAP" && sub.Length >= 4)
+                    ammoFormId = BinaryPrimitives.ReadUInt32LittleEndian(sub);
                 // SPEL SPIT = uint32 spellType, ... — the FNV spell-type enum; type 10 = Addiction (a withdrawal
                 // effect). Lets the player added-spell list flag which entries are addictions (SPEC §4n).
                 else if (type == "SPIT" && sig == "SPEL" && sub.Length >= 4)
@@ -551,6 +635,8 @@ public sealed class TesPlugin
             var name = full ?? edid;
             if (!string.IsNullOrEmpty(name))
                 forms.Add((formId, name, sig, noteType, health, spellType)); // sig is the record type (WEAP/ARMO/ALCH/SPEL/…)
+            if (sig == "WEAP")
+                weaponStats.Add(new RawWeaponStats(formId, skillAv, baseDamage, clipSize, weight, fireRate, strengthReq, skillReq, projectileFormId, ammoFormId));
             if (sig == "QUST")
                 quests.Add(ParseQuest(formId, subs, localized, full, edid));
         }
@@ -763,6 +849,88 @@ public sealed class TesPlugin
             }
             else
                 fs.Seek(size, SeekOrigin.Current);
+        }
+    }
+
+    /// <summary>Reads <c>PROJ</c> (Projectile) records' <c>DATA.Explosion</c> field — the link a weapon decision
+    /// matrix needs to reach an explosive weapon's real area damage (ROADMAP: weapon decision-matrix). Flat,
+    /// non-recursive top-level group, same shape as <see cref="ReadActorScripts"/>.</summary>
+    private static void ReadProjectiles(Stream fs, long contentSize, List<RawProjectile> projectiles)
+    {
+        var end = fs.Position + contentSize;
+        while (fs.Position < end)
+        {
+            var sig = ReadSignature(fs);
+            if (sig is null) break;
+            var size = ReadU32(fs);
+            if (sig == "GRUP") { ReadExactly(fs, 16); fs.Seek((long)size - HeaderSize, SeekOrigin.Current); continue; }
+            var flags = ReadU32(fs);
+            var formId = ReadU32(fs);
+            ReadExactly(fs, 8);
+            var data = ReadExactly(fs, (int)size);
+            if ((flags & CompressedFlag) != 0) data = Decompress(data);
+            foreach (var (type, sub) in ParseSubrecords(data))
+                if (type == "DATA" && sub.Length >= 40) // Explosion formid sits at offset 36 of PROJ's DATA struct
+                {
+                    projectiles.Add(new RawProjectile(formId, BinaryPrimitives.ReadUInt32LittleEndian(sub.AsSpan(36, 4))));
+                    break;
+                }
+        }
+    }
+
+    /// <summary>Reads <c>EXPL</c> (Explosion) records' <c>DATA.Damage</c>/<c>Radius</c> — a weapon's real area
+    /// damage, reached via <c>WEAP.DNAM.Projectile</c> -&gt; <c>PROJ.DATA.Explosion</c> -&gt; here (ROADMAP:
+    /// weapon decision-matrix; <c>WEAP.DATA.BaseDamage</c> is only a direct-hit placeholder for an explosive
+    /// weapon, see <see cref="RawWeaponStats"/>).</summary>
+    private static void ReadExplosions(Stream fs, long contentSize, List<RawExplosion> explosions)
+    {
+        var end = fs.Position + contentSize;
+        while (fs.Position < end)
+        {
+            var sig = ReadSignature(fs);
+            if (sig is null) break;
+            var size = ReadU32(fs);
+            if (sig == "GRUP") { ReadExactly(fs, 16); fs.Seek((long)size - HeaderSize, SeekOrigin.Current); continue; }
+            var flags = ReadU32(fs);
+            var formId = ReadU32(fs);
+            ReadExactly(fs, 8);
+            var data = ReadExactly(fs, (int)size);
+            if ((flags & CompressedFlag) != 0) data = Decompress(data);
+            foreach (var (type, sub) in ParseSubrecords(data))
+                if (type == "DATA" && sub.Length >= 12) // Damage @ offset 4, Radius @ offset 8 of EXPL's DATA struct
+                {
+                    explosions.Add(new RawExplosion(formId,
+                        BinaryPrimitives.ReadSingleLittleEndian(sub.AsSpan(4, 4)),
+                        BinaryPrimitives.ReadSingleLittleEndian(sub.AsSpan(8, 4))));
+                    break;
+                }
+        }
+    }
+
+    /// <summary>Reads <c>FLST</c> (FormID List) records' member FormIDs (<c>LNAM</c>, repeated 0+ times) — a
+    /// weapon's <c>NAM0</c> ammo field very often points at one of these rather than a single <c>AMMO</c>
+    /// record directly (e.g. a .357 Magnum Round's HP/Hand Load/Match-grade variants share one list, so any of
+    /// them counts as "ammo for this weapon"). ROADMAP: weapon decision-matrix.</summary>
+    private static void ReadFormLists(Stream fs, long contentSize, List<RawFormList> formLists)
+    {
+        var end = fs.Position + contentSize;
+        while (fs.Position < end)
+        {
+            var sig = ReadSignature(fs);
+            if (sig is null) break;
+            var size = ReadU32(fs);
+            if (sig == "GRUP") { ReadExactly(fs, 16); fs.Seek((long)size - HeaderSize, SeekOrigin.Current); continue; }
+            var flags = ReadU32(fs);
+            var formId = ReadU32(fs);
+            ReadExactly(fs, 8);
+            if (sig != "FLST") { fs.Seek(size, SeekOrigin.Current); continue; }
+            var data = ReadExactly(fs, (int)size);
+            if ((flags & CompressedFlag) != 0) data = Decompress(data);
+            var members = new List<uint>();
+            foreach (var (type, sub) in ParseSubrecords(data))
+                if (type == "LNAM" && sub.Length >= 4)
+                    members.Add(BinaryPrimitives.ReadUInt32LittleEndian(sub));
+            formLists.Add(new RawFormList(formId, members));
         }
     }
 
@@ -1050,3 +1218,39 @@ public sealed record QuestDefinition(
     /// the Pip-Boy Quests list (dialogue/script-only quests have neither). The first-order Pip-Boy filter.</summary>
     public bool IsPlayerFacing => !string.IsNullOrEmpty(Name) && Objectives.Count > 0;
 }
+
+/// <summary>A <c>WEAP</c> record's real combat stats (ROADMAP: weapon decision-matrix feature), keyed by
+/// <b>plugin-local</b> FormID (re-keyed into save space, and its explosive-weapon area damage resolved, by
+/// <see cref="WeaponStatsDatabase"/>). <see cref="BaseDamage"/>/<see cref="ClipSize"/>/<see cref="Weight"/> are
+/// the <c>WEAP.DATA</c> struct (the same subrecord <see cref="TesPlugin.Forms"/> already reads for max
+/// condition); everything else is <c>DNAM</c>. Field layout: https://tes5edit.github.io/fopdoc/FalloutNV/Records/WEAP.html
+/// <para><see cref="Skill"/> is the raw FNV Actor Value enum the weapon trains/is governed by (34 = Energy
+/// Weapons, 35 = Explosives, 38 = Melee Weapons, 41 = Guns, 45 = Unarmed; -1 if the record carried no usable
+/// <c>DNAM</c>) — see <see cref="WeaponSkillTier"/> for the ranking-tier mapping.</para>
+/// <para><see cref="ProjectileFormId"/> (plugin-local, 0 = none) is <c>DNAM.Projectile</c> — the <c>PROJ</c>
+/// record a fired/thrown instance of this weapon spawns. For an explosive weapon this is the <b>only</b> path
+/// to its real area damage: <see cref="BaseDamage"/> there is just a direct-hit placeholder (verified: Frag
+/// Grenade's own <c>WEAP.DATA.BaseDamage</c> is 1; its real area damage, resolved via
+/// <c>Projectile -&gt; PROJ.DATA.Explosion -&gt; EXPL.DATA.Damage</c>, is 125).</para>
+/// <para><see cref="AmmoFormId"/> (plugin-local, 0 = none) is <c>NAM0</c> — the <c>AMMO</c>/<c>FLST</c> this
+/// weapon consumes, or 0 for a self-ammo'd weapon (thrown/placed ordnance: Dynamite, Frag Grenade/Mine,
+/// Throwing Spear). A weapon's real "how long can I sustain this" figure is that ammo's own inventory stock,
+/// not the gun's own stack count (almost always 1 — ammo is tracked as a separate stack).</para></summary>
+public sealed record RawWeaponStats(
+    uint FormId, int Skill, int BaseDamage, int ClipSize, float Weight, float FireRate,
+    int StrengthRequirement, int SkillRequirement, uint ProjectileFormId, uint AmmoFormId);
+
+/// <summary>A <c>PROJ</c> (Projectile) record's <c>DATA.Explosion</c> field (plugin-local FormID, 0 = none) —
+/// the <c>EXPL</c> record a weapon's projectile actually detonates into, carrying its real area damage.</summary>
+public sealed record RawProjectile(uint FormId, uint ExplosionFormId);
+
+/// <summary>An <c>EXPL</c> (Explosion) record's real area <c>Damage</c> and <c>Radius</c> (its <c>DATA</c>
+/// struct) — the ground-truth AoE figures a thrown/launched explosive weapon's own <c>WEAP.DATA.BaseDamage</c>
+/// cannot show (that field is just a direct-hit placeholder there).</summary>
+public sealed record RawExplosion(uint FormId, float Damage, float Radius);
+
+/// <summary>An <c>FLST</c> (FormID List) record's member FormIDs (plugin-local). A weapon's <c>NAM0</c> ammo
+/// field very often points at one of these (shared HP/Hand Load/Match-grade ammo variants) rather than a
+/// single <c>AMMO</c> record directly — <see cref="WeaponStatsDatabase"/> flattens it so any member counts as
+/// "ammo for this weapon".</summary>
+public sealed record RawFormList(uint FormId, IReadOnlyList<uint> Members);
